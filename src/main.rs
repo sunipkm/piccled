@@ -1,12 +1,16 @@
 //! Control an LED connected to GPIO6 of a RP2040 using
 //! 10 kHz PWM.
-//! 
+//!
 //! The RP2040 is exposed to the host as a CDC ACM serial
-//! device 
+//! device
 #![no_std]
 #![no_main]
 
-use core::{panic, str::from_utf8};
+use core::{
+    fmt::{self, Write},
+    panic,
+    str::from_utf8,
+};
 
 use defmt::*;
 use embassy_executor::Spawner;
@@ -111,7 +115,7 @@ async fn main(_spawner: Spawner) {
     // It needs some buffers for building the descriptors.
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 64];
+    let mut control_buf = [0; 512];
 
     let mut state = CdcAcmState::new();
 
@@ -137,7 +141,7 @@ async fn main(_spawner: Spawner) {
     info!("Running USB device");
 
     // PWM Controller
-    let mut pwm = {
+    let (mut pwma, mut pwmled) = {
         let desired_freq_hz = 10_000; // 10 kHz
         let clk_hz = clocks::clk_sys_freq(); // Clock frequency in Hz
         let divider = 16u8;
@@ -146,14 +150,21 @@ async fn main(_spawner: Spawner) {
         let mut pwmcfg = PwmConfig::default();
         pwmcfg.top = period;
         pwmcfg.divider = divider.into();
-        Pwm::new_output_a(p.PWM_SLICE3, p.PIN_6, pwmcfg)
+        (
+            Pwm::new_output_a(p.PWM_SLICE3, p.PIN_6, pwmcfg.clone()),
+            Pwm::new_output_b(p.PWM_SLICE4, p.PIN_25, pwmcfg),
+        )
     };
 
-    pwm.set_duty_cycle_fully_off()
+    pwma.set_duty_cycle_fully_off()
+        .expect("Could not turn off the PWM pin.");
+    pwmled
+        .set_duty_cycle_fully_off()
         .expect("Could not turn off the PWM pin.");
     info!("Started PWM cycle in fully off mode.");
 
     let mut data = [0; 64];
+    let mut output = Buffer([0; 64], 0);
     let control_fut = async {
         loop {
             class.wait_connection().await;
@@ -167,18 +178,38 @@ async fn main(_spawner: Spawner) {
                 {
                     info!("Received: {}", s);
                     if let Err(e) = {
-                        if pwm.set_duty_cycle_percent(s).is_err() {
-                            error!("Error setting PWM to {}%.", s);
-                            class.write_packet(b"ERR\r\n")
-                        } else {
-                            class.write_packet(b"OK")
+                        if pwmled.set_duty_cycle_percent(s).is_err() {
+                            error!("Error setting LED PWM to {}%.", s);
                         }
+                        if pwma.set_duty_cycle_percent(s).is_err() {
+                            error!("Error setting PWM to {}%.", s);
+                            if core::write!(&mut output, "ERR {s}\r\n").is_err() {
+                                error!("Could not write output to buffer.");
+                            }
+                        } else if core::write!(&mut output, "OK {s}\r\n").is_err() {
+                            error!("Could not write output to buffer.");
+                        }
+                        class.write_packet(&output.0[..output.1])
                     }
                     .await
                     {
                         error!("Could not write output to USB: {:?}", e);
                     }
+                } else {
+                    error!("Received invalid data: {:?}", &data[..n]);
+                    if core::write!(&mut output, "ERR\r\n").is_err() {
+                        error!("Could not write output to buffer.");
+                    }
+                    if class.write_packet(&output.0[..output.1]).await.is_err() {
+                        error!("Could not write output to USB.");
+                    }
                 }
+            }
+            if pwma.set_duty_cycle_fully_off().is_err() {
+                error!("Could not turn off the PWM pin.");
+            }
+            if pwmled.set_duty_cycle_fully_off().is_err() {
+                error!("Could not turn off the PWM pin.");
             }
         }
     };
@@ -186,6 +217,7 @@ async fn main(_spawner: Spawner) {
     embassy_join!((usb_fut, control_fut)).await;
 }
 
+#[derive(Debug)]
 struct Disconnected {}
 
 impl From<EndpointError> for Disconnected {
@@ -193,6 +225,21 @@ impl From<EndpointError> for Disconnected {
         match val {
             EndpointError::BufferOverflow => panic!("Buffer overflow"),
             EndpointError::Disabled => Disconnected {},
+        }
+    }
+}
+
+struct Buffer<const N: usize>([u8; N], usize);
+
+impl<const N: usize> Write for Buffer<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let space_left = self.0.len() - self.1;
+        if space_left > s.len() {
+            self.0[self.1..][..s.len()].copy_from_slice(s.as_bytes());
+            self.1 += s.len();
+            Ok(())
+        } else {
+            Err(fmt::Error)
         }
     }
 }
