@@ -7,7 +7,6 @@
 #![no_main]
 
 use core::{
-    fmt::{self, Write},
     panic,
     str::from_utf8,
 };
@@ -164,7 +163,6 @@ async fn main(_spawner: Spawner) {
     info!("Started PWM cycle in fully off mode.");
 
     let mut data = [0; 64];
-    let mut output = Buffer([0; 64], 0);
     let control_fut = async {
         loop {
             class.wait_connection().await;
@@ -181,15 +179,13 @@ async fn main(_spawner: Spawner) {
                         if pwmled.set_duty_cycle_percent(s).is_err() {
                             error!("Error setting LED PWM to {}%.", s);
                         }
-                        if pwma.set_duty_cycle_percent(s).is_err() {
+                        let out = if pwma.set_duty_cycle_percent(s).is_err() {
                             error!("Error setting PWM to {}%.", s);
-                            if core::write!(&mut output, "ERR {s}\r\n").is_err() {
-                                error!("Could not write output to buffer.");
-                            }
-                        } else if core::write!(&mut output, "OK {s}\r\n").is_err() {
-                            error!("Could not write output to buffer.");
-                        }
-                        class.write_packet(&output.0[..output.1])
+                            b"ERR\r\n"
+                        } else {
+                            b"OK \r\n"
+                        };
+                        class.write_packet(out)
                     }
                     .await
                     {
@@ -197,12 +193,6 @@ async fn main(_spawner: Spawner) {
                     }
                 } else {
                     error!("Received invalid data: {:?}", &data[..n]);
-                    if core::write!(&mut output, "ERR\r\n").is_err() {
-                        error!("Could not write output to buffer.");
-                    }
-                    if class.write_packet(&output.0[..output.1]).await.is_err() {
-                        error!("Could not write output to USB.");
-                    }
                 }
             }
             if pwma.set_duty_cycle_fully_off().is_err() {
@@ -225,21 +215,6 @@ impl From<EndpointError> for Disconnected {
         match val {
             EndpointError::BufferOverflow => panic!("Buffer overflow"),
             EndpointError::Disabled => Disconnected {},
-        }
-    }
-}
-
-struct Buffer<const N: usize>([u8; N], usize);
-
-impl<const N: usize> Write for Buffer<N> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let space_left = self.0.len() - self.1;
-        if space_left > s.len() {
-            self.0[self.1..][..s.len()].copy_from_slice(s.as_bytes());
-            self.1 += s.len();
-            Ok(())
-        } else {
-            Err(fmt::Error)
         }
     }
 }
